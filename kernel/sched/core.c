@@ -90,6 +90,8 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/sched.h>
 
+static int sched_energy_alpha = 1;
+
 void start_bandwidth_timer(struct hrtimer *period_timer, ktime_t period)
 {
 	unsigned long delta;
@@ -1868,6 +1870,23 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 
 	INIT_LIST_HEAD(&p->rt.run_list);
 
+	//init energy task info.
+	INIT_LIST_HEAD(&p->ee.list_item);
+	p->ee.execute_start = 0;
+	p->ee.total_execution = 0;
+	p->ee.instance = p;
+	p->ee.select = 0;
+	p->ee.first = 1;
+	p->ee.need_move = -1;
+	p->ee.split = 0;
+	p->ee.over_predict = 0;
+	if (sched_energy_alpha != 1) {
+		p->ee.alpha = sched_energy_alpha;
+		sched_energy_alpha = 1;
+	}
+	else
+		p->ee.alpha = 1;
+
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	INIT_HLIST_HEAD(&p->preempt_notifiers);
 #endif
@@ -1985,6 +2004,8 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		return -EAGAIN;
 	} else if (rt_prio(p->prio)) {
 		p->sched_class = &rt_sched_class;
+	} else if (p->ee.alpha != 1) {
+		p->sched_class = &energy_sched_class;
 	} else {
 		p->sched_class = &fair_sched_class;
 	}
@@ -3366,7 +3387,9 @@ static void __setscheduler(struct rq *rq, struct task_struct *p,
 	else
 		p->prio = normal_prio(p);
 
-	if (dl_prio(p->prio))
+	if (p->policy == SCHED_ENERGY)
+		p->sched_class = &energy_sched_class;
+	else if (dl_prio(p->prio))
 		p->sched_class = &dl_sched_class;
 	else if (rt_prio(p->prio)) {
 		p->sched_class = &rt_sched_class;
@@ -4490,6 +4513,7 @@ SYSCALL_DEFINE1(sched_get_priority_max, int, policy)
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
+	case SCHED_ENERGY:
 		ret = 0;
 		break;
 	}
@@ -4517,6 +4541,7 @@ SYSCALL_DEFINE1(sched_get_priority_min, int, policy)
 	case SCHED_NORMAL:
 	case SCHED_BATCH:
 	case SCHED_IDLE:
+	case SCHED_ENERGY:
 		ret = 0;
 	}
 	return ret;
@@ -4570,6 +4595,15 @@ SYSCALL_DEFINE2(sched_rr_get_interval, pid_t, pid,
 out_unlock:
 	rcu_read_unlock();
 	return retval;
+}
+
+// energy-credit scheduler system call.
+SYSCALL_DEFINE1(sched_energy_set_alpha, int, alpha)
+{
+	if (alpha < 1)
+		return -EINVAL;
+	sched_energy_alpha = alpha;
+	return 0;
 }
 
 static const char stat_nam[] = TASK_STATE_TO_CHAR_STR;
@@ -7033,6 +7067,18 @@ int in_sched_functions(unsigned long addr)
 		&& addr < (unsigned long)__sched_text_end);
 }
 
+void init_energy_rq(struct rq *rq)
+{
+	struct energy_rq *e_rq = &rq->energy;
+	INIT_LIST_HEAD(&e_rq->queue);
+	e_rq->energy_nr_running = 0;
+	e_rq->rq = rq;
+	e_rq->freq = NULL;
+	e_rq->state_number = 0;
+	e_rq->set_freq = -1;
+	hrtimer_init(&e_rq->hr_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+}
+
 #ifdef CONFIG_CGROUP_SCHED
 /*
  * Default task group.
@@ -7180,6 +7226,9 @@ void __init sched_init(void)
 #endif
 		init_rq_hrtick(rq);
 		atomic_set(&rq->nr_iowait, 0);
+
+		// energy-credit scheduler init
+		init_energy_rq(rq);
 	}
 
 	set_load_weight(&init_task);
@@ -7217,6 +7266,7 @@ void __init sched_init(void)
 	idle_thread_set_boot_cpu();
 	set_cpu_rq_start_time();
 #endif
+	init_sched_energy_class();
 	init_sched_fair_class();
 
 	scheduler_running = 1;

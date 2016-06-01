@@ -1265,6 +1265,27 @@ enum perf_event_task_context {
 	perf_nr_task_contexts,
 };
 
+/* energy-credit based scheduler  |task entity */
+struct sched_energy_entity {
+	//statistics
+	u64 execute_start;
+	u32 select; // to be executed
+	int need_move;
+	int first;
+	u64 total_execution;
+
+	int over_predict; //half-scaling
+	u64 workload; // prediction
+	u64 dummy_workload;
+	u64 credit[NR_CPUS]; // calculate	
+	int split;
+	int alpha;
+	struct task_struct *instance;
+	// queue 
+	struct energy_rq *rq_e;
+	struct list_head list_item;
+};
+
 struct task_struct {
 	volatile long state;	/* -1 unrunnable, 0 runnable, >0 stopped */
 	void *stack;
@@ -1292,6 +1313,7 @@ struct task_struct {
 	struct task_group *sched_task_group;
 #endif
 	struct sched_dl_entity dl;
+	struct sched_energy_entity ee;
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	/* list of struct preempt_notifier: */
@@ -2133,6 +2155,7 @@ static inline int set_cpus_allowed(struct task_struct *p, cpumask_t new_mask)
  * Please use one of the three interfaces below.
  */
 extern unsigned long long notrace sched_clock(void);
+extern unsigned long long notrace cpu_cycle(void);
 /*
  * See the comment in kernel/sched/clock.c
  */

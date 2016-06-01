@@ -281,10 +281,10 @@ static inline void adjust_jiffies(unsigned long val, struct cpufreq_freqs *ci)
 static void __cpufreq_notify_transition(struct cpufreq_policy *policy,
 		struct cpufreq_freqs *freqs, unsigned int state)
 {
-	BUG_ON(irqs_disabled());
+	//BUG_ON(irqs_disabled());
 
-	if (cpufreq_disabled())
-		return;
+	//if (cpufreq_disabled())
+	//	return;
 
 	freqs->flags = cpufreq_driver->flags;
 	pr_debug("notification %u of frequency transition to %u kHz\n",

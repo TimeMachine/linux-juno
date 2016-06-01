@@ -74,6 +74,11 @@ unsigned long long __weak sched_clock(void)
 }
 EXPORT_SYMBOL_GPL(sched_clock);
 
+unsigned long long cpu_cylce(void)
+{
+	return (unsigned long long)jiffies - INITIAL_JIFFIES;
+}
+
 __read_mostly int sched_clock_running;
 
 #ifdef CONFIG_HAVE_UNSTABLE_SCHED_CLOCK

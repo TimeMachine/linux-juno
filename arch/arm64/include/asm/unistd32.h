@@ -795,3 +795,5 @@ __SYSCALL(__NR_getrandom, sys_getrandom)
 __SYSCALL(__NR_memfd_create, sys_memfd_create)
 #define __NR_bpf 386
 __SYSCALL(__NR_bpf, sys_bpf)
+#define __NR_sched_energy_set_alpha 387
+__SYSCALL(__NR_sched_energy_set_alpha, sys_sched_energy_set_alpha)

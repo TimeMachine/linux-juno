@@ -92,6 +92,11 @@ static inline int dl_policy(int policy)
 	return policy == SCHED_DEADLINE;
 }
 
+static inline int energy_policy(int policy)
+{
+	return policy == SCHED_ENERGY;
+}
+
 static inline int task_has_rt_policy(struct task_struct *p)
 {
 	return rt_policy(p->policy);
@@ -511,6 +516,19 @@ extern struct root_domain def_root_domain;
 
 #endif /* CONFIG_SMP */
 
+/* energy-credit based scheduler  |runqueues */
+struct energy_rq {
+	unsigned long energy_nr_running;
+	struct rq *rq;
+	struct list_head queue;
+	u64 timeslice_start;
+	u64 time_sharing;
+	unsigned int *freq;
+	int set_freq;
+	int state_number;
+	struct hrtimer hr_timer;
+};
+
 /*
  * This is the main, per-CPU runqueue data structure.
  *
@@ -551,6 +569,7 @@ struct rq {
 	struct cfs_rq cfs;
 	struct rt_rq rt;
 	struct dl_rq dl;
+	struct energy_rq energy;
 
 #ifdef CONFIG_FAIR_GROUP_SCHED
 	/* list of leaf cfs_rq on this cpu: */
@@ -1164,6 +1183,7 @@ static inline void put_prev_task(struct rq *rq, struct task_struct *prev)
    for (class = sched_class_highest; class; class = class->next)
 
 extern const struct sched_class stop_sched_class;
+extern const struct sched_class energy_sched_class;
 extern const struct sched_class dl_sched_class;
 extern const struct sched_class rt_sched_class;
 extern const struct sched_class fair_sched_class;
@@ -1217,7 +1237,7 @@ extern void update_max_interval(void);
 extern void init_sched_dl_class(void);
 extern void init_sched_rt_class(void);
 extern void init_sched_fair_class(void);
-extern void init_sched_dl_class(void);
+extern void init_sched_energy_class(void);
 
 extern void resched_curr(struct rq *rq);
 extern void resched_cpu(int cpu);

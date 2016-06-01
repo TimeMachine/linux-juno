@@ -77,6 +77,11 @@ unsigned long long notrace sched_clock(void)
 	return epoch_ns + cyc_to_ns(cyc, cd.mult, cd.shift);
 }
 
+unsigned long long notrace cpu_cycle(void)
+{
+	return jiffy_sched_clock_read();
+}
+
 /*
  * Atomically update the sched_clock epoch.
  */
