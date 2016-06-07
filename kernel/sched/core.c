@@ -1828,6 +1828,29 @@ void __dl_clear_params(struct task_struct *p)
 	dl_se->dl_bw = 0;
 }
 
+void __energy_task_init(struct task_struct *p)
+{
+	//init energy task info.
+	int i;
+	INIT_LIST_HEAD(&p->ee.list_item);
+	p->ee.execute_start = 0;
+	p->ee.total_execution = 0;
+	p->ee.instance = p;
+	p->ee.select = 0;
+	p->ee.first = 1;
+	p->ee.need_move = -1;
+	p->ee.split = 0;
+	p->ee.over_predict = 0;
+	for (i = 0; i < NR_CPUS; i++)
+		p->ee.credit[i] = 0;
+	if (sched_energy_alpha != 1) {
+		p->ee.alpha = sched_energy_alpha;
+		sched_energy_alpha = 1;
+	}
+	else
+		p->ee.alpha = 1;
+}
+
 /*
  * Perform scheduler related setup for a newly forked process p.
  * p is forked by current.
@@ -1867,25 +1890,9 @@ static void __sched_fork(unsigned long clone_flags, struct task_struct *p)
 	RB_CLEAR_NODE(&p->dl.rb_node);
 	hrtimer_init(&p->dl.dl_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
 	__dl_clear_params(p);
+	__energy_task_init(p);
 
 	INIT_LIST_HEAD(&p->rt.run_list);
-
-	//init energy task info.
-	INIT_LIST_HEAD(&p->ee.list_item);
-	p->ee.execute_start = 0;
-	p->ee.total_execution = 0;
-	p->ee.instance = p;
-	p->ee.select = 0;
-	p->ee.first = 1;
-	p->ee.need_move = -1;
-	p->ee.split = 0;
-	p->ee.over_predict = 0;
-	if (sched_energy_alpha != 1) {
-		p->ee.alpha = sched_energy_alpha;
-		sched_energy_alpha = 1;
-	}
-	else
-		p->ee.alpha = 1;
 
 #ifdef CONFIG_PREEMPT_NOTIFIERS
 	INIT_HLIST_HEAD(&p->preempt_notifiers);
@@ -3499,7 +3506,7 @@ recheck:
 	} else {
 		reset_on_fork = !!(attr->sched_flags & SCHED_FLAG_RESET_ON_FORK);
 
-		if (policy != SCHED_DEADLINE &&
+		if (policy != SCHED_DEADLINE && policy != SCHED_ENERGY &&
 				policy != SCHED_FIFO && policy != SCHED_RR &&
 				policy != SCHED_NORMAL && policy != SCHED_BATCH &&
 				policy != SCHED_IDLE)

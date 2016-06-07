@@ -502,6 +502,20 @@ static struct cpufreq_driver bL_cpufreq_driver = {
 	.attr			= cpufreq_generic_attr,
 };
 
+unsigned int get_stats_table(int cpu, unsigned int **freq)
+{
+	int count = 0, i = 0;
+	struct cpufreq_frequency_table *pos;
+	int cluster = cpu_to_cluster(cpu);	
+	cpufreq_for_each_valid_entry(pos, freq_table[cluster])
+		count++;
+	*freq = (unsigned int*)kmalloc(sizeof(unsigned int) * count, __GFP_IO | __GFP_FS);
+	cpufreq_for_each_valid_entry(pos, freq_table[cluster])
+		(*freq)[i++] = pos->frequency;	
+	return count;
+}
+EXPORT_SYMBOL(get_stats_table);
+
 #ifdef CONFIG_BL_SWITCHER
 static int bL_cpufreq_switcher_notifier(struct notifier_block *nfb,
 					unsigned long action, void *_arg)
