@@ -21,9 +21,10 @@ static u32 freq_now;
 #endif
 
 #ifdef juno
-#define little_cpu 6
-#define big_cpu 0
+#define little_cpu 4
+#define big_cpu 2
 #define _MAX_CPU 6
+static int index[2][4] = {{0,3,4,5}, {1,2}}; // Little core cluster and Big core cluster.
 #endif
 
 // lock by main_schedule
@@ -222,6 +223,11 @@ select_task_rq_energy(struct task_struct *p, int cpu, int sd_flag, int flags)
 	return task_cpu(p); 
 }
 
+static void post_schedule_energy(struct rq *rq)
+{
+    rq->curr->ee.select = 0;
+}
+
 static void pre_schedule_energy(struct rq *rq, struct task_struct *prev)
 {
 #ifdef _debug
@@ -369,13 +375,14 @@ pick_next_task_energy(struct rq *rq, struct task_struct *prev)
 			ktime_t ktime;
 			rq->energy.hr_timer.function = sched_resched_timer;
 			ktime = ktime_set(0, 5 * NSEC_PER_MSEC);
-			hrtimer_start( &rq->energy.hr_timer, ktime, HRTIMER_MODE_REL);
+			start_bandwidth_timer(&rq->energy.hr_timer, ktime);
 		}
 		return NULL;
 	}
 	next = container_of(next_ee, struct task_struct, ee);
 	next->se.exec_start = rq->clock_task;
 	next->ee.execute_start = get_cpu_cycle();
+	rq->post_schedule = 1;
 #ifdef _debug_pick
 	printk("[%s] cpu:%d pid:%d credit:%llu\n",__PRETTY_FUNCTION__,rq->cpu,next->pid, next->ee.credit[rq->cpu]);
 #endif
@@ -425,7 +432,7 @@ enqueue_task_energy(struct rq *rq, struct task_struct *p, int flags)
 		if (total_job == 1) {
 			ktime_t ktime;
 			ktime = ktime_set(0, NSEC_PER_SEC);
-			hrtimer_start( &hr_timer, ktime, HRTIMER_MODE_REL);
+			start_bandwidth_timer(&hr_timer, ktime);
 		}
 		need_reschedule = 1;
 		p->ee.first = 0;
@@ -573,24 +580,97 @@ static int compare(const void *a, const void *b)
 	return 0;
 }
 
+#define Max_jobs 1000
+static struct sched_energy_entity *data[Max_jobs]; 
+static void scheduling_cluster(int *cpu_mask, int core_count, int job_count, int ptr,
+								 u64 total_workload, unsigned int *o_freq)
+{
+	#define soft_float 1000000
+	int i = 0, j = 0;
+	int ptr_max = ptr;
+	unsigned int pre_load = 0;
+	struct rq *i_rq;
+
+	pre_load = 0;
+	for (; cpu_mask[i] != -1; i++) {
+		int f_total = 0;
+		int a_jp = 0;
+		//printk("[algo debug] i:%d ptr:%d total_workload:%llu\n",i ,ptr,total_workload);
+		i_rq = cpu_rq(i);
+		if (total_workload == 0) {
+			o_freq[i] = 0;
+			continue;
+		}
+		for (j = 0; j < i_rq->energy.state_number; j++) {
+			if (((u64) i_rq->energy.freq[j] * kHZ < data[ptr_max]->dummy_workload) ||
+					((u64) i_rq->energy.freq[j] * kHZ * (core_count - i) < total_workload) ||
+					((1 * soft_float - pre_load) < (data[ptr]->dummy_workload) / (i_rq->energy.freq[j] * kHZ / soft_float) ))
+				break;
+		}
+		//printk("__debug cpu_rq(i)->energy.freq[j]:%d,data[ptr_max]->workload:%llu,total_workload:%llu,pre_load:%u\n",cpu_rq(i)->energy.freq[j],data[ptr_max]->dummy_workload,total_workload,pre_load);
+		o_freq[i] = j == 0 ? i_rq->energy.freq[j] : i_rq->energy.freq[j-1];  	
+		f_total = o_freq[i] * kHZ;
+		a_jp = 0;
+		while ( ptr < job_count ) {
+			int state = 0;
+			if (f_total >= data[ptr]->dummy_workload)
+				state = 1;
+			a_jp = state ? data[ptr]->dummy_workload : f_total;
+			total_workload -= a_jp;
+			f_total -= a_jp;
+#ifdef odroid_xu
+			data[ptr]->credit[i] = cycle_to_jiffies(a_jp, o_freq[i]);
+#else
+			data[ptr]->credit[i] = a_jp;
+#endif
+			if (state) {
+				if (data[ptr]->need_move != -1 && data[ptr]->need_move != i) {
+					data[ptr]->need_move = i;
+					move_task_to_rq(i_rq ,data[ptr] ,0);
+				}
+				else {
+					if (data[ptr]->rq_e->rq->cpu != i && data[ptr]->instance->on_rq) {
+						// if task is scheduled to other cpu, task have to move to other queue.
+						printk("[algo] pid:%d ,from:%d ,to:%d\n",data[ptr]->instance->pid,data[ptr]->rq_e->rq->cpu,i_rq->cpu);
+						if (data[ptr]->select == 0 && 
+								data[ptr]->instance->pid != data[ptr]->rq_e->rq->curr->pid &&
+								data[ptr]->instance->pid != cpu_rq(task_cpu(data[ptr]->instance))->curr->pid)
+							move_task_to_rq(i_rq ,data[ptr] ,1);
+						else {
+							data[ptr]->need_move = i;
+							move_task_to_rq(i_rq ,data[ptr] ,0);
+						}
+						printk("[algo] select:%d from_pid:%d true_pid:%d\n",data[ptr]->select,data[ptr]->rq_e->rq->curr->pid,cpu_rq(task_cpu(data[ptr]->instance))->curr->pid);
+					}
+				}
+				ptr++;
+				ptr_max = ptr;
+				pre_load = 0;
+			}
+			else {
+				data[ptr]->dummy_workload -= a_jp;
+				data[ptr]->split = 1;
+				pre_load = a_jp / (o_freq[i] * kHZ / soft_float);
+				if (ptr + 1 < job_count && 
+						data[ptr]->dummy_workload < data[ptr+1]->dummy_workload)
+					ptr_max++;
+			}
+			if (!f_total)
+				break;
+		}
+	}
+}
+
 static void algo(int workload_predict)
 {
 	u64 total_workload = 0;
 	unsigned int o_freq[_MAX_CPU] = {0};
-	#define Max_jobs 1000
-	struct sched_energy_entity **data = (struct sched_energy_entity **)kmalloc(sizeof(struct sched_energy_entity *)*Max_jobs, __GFP_IO | __GFP_FS);
 	int job_count = 0, cluster_job = 0;
 	struct rq *i_rq;
 	struct list_head *head;
 	struct list_head *pos;
 	int i = 0 ,j = 0, k = 0;
 	int core_count = 0;
-	#define soft_float 1000000
-	int ptr = 0;
-	int ptr_max = 0;
-	unsigned int pre_load = 0;
-	int o_cpu = 0;
-	int max_freq = 0;
 
 	_all_rq_lock();
 	for (i = 0 ;i < _MAX_CPU; i++) {
@@ -639,97 +719,22 @@ static void algo(int workload_predict)
 		printk("  (%d) %4llu %d|", data[j]->instance->pid, data[j]->dummy_workload, data[j]->alpha);
 	printk("\n");
 #endif
+
 	for (i = 0,k = 0; k < 2; k++) {
-		int base = 0;
-		int job_base = 0;
-		if (k == 0)
-			core_count = little_cpu;
-		else {
-			base = little_cpu;
-			core_count = big_cpu;
-		}
-		j = job_count - cluster_job - 1;
+		core_count = k == 0 ? little_cpu : big_cpu;
+		j = job_count - cluster_job - 1; //the index of the remaining task.
 		cluster_job = 0;
 		total_workload = 0;
 		for (; j >= 0; j--) {
 			//over big cluster workload. Given tasks as more as possible.
 			if (total_workload + data[j]->dummy_workload > 
-				(u64)cpu_rq(base)->energy.freq[0] * core_count * kHZ && k == 0) 
+					(u64)cpu_rq(index[k][0])->energy.freq[0] * core_count * kHZ && k == 0) 
 				break;
 			total_workload += data[j]->dummy_workload;
 			cluster_job++;
 		}
-		ptr = j + 1; 
-		ptr_max = ptr;
-		job_base = ptr;
-		pre_load = 0;
-		for (; i < base + core_count; i++) {
-			int f_total = 0;
-			int a_jp = 0;
-			//printk("[algo debug] i:%d ptr:%d total_workload:%llu\n",i ,ptr,total_workload);
-			i_rq = cpu_rq(i);
-			if (total_workload == 0) {
-				o_freq[i] = 0;
-				continue;
-			}
-			for (j = 0; j < i_rq->energy.state_number; j++) {
-				if (((u64) i_rq->energy.freq[j] * kHZ < data[ptr_max]->dummy_workload) ||
-					((u64) i_rq->energy.freq[j] * kHZ * (base + core_count - i) < total_workload) ||
-					((1 * soft_float - pre_load) < (data[ptr]->dummy_workload) / (i_rq->energy.freq[j] * kHZ / soft_float) ))
-					break;
-			}
-			//printk("__debug cpu_rq(i)->energy.freq[j]:%d,data[ptr_max]->workload:%llu,total_workload:%llu,pre_load:%u\n",cpu_rq(i)->energy.freq[j],data[ptr_max]->dummy_workload,total_workload,pre_load);
-			o_freq[i] = j == 0 ? i_rq->energy.freq[j] : i_rq->energy.freq[j-1];  	
-			f_total = o_freq[i] * kHZ;
-			a_jp = 0;
-			while ( ptr < job_base + cluster_job ) {
-				int state = 0;
-				if (f_total >= data[ptr]->dummy_workload)
-					state = 1;
-				a_jp = state ? data[ptr]->dummy_workload : f_total;
-				total_workload -= a_jp;
-				f_total -= a_jp;
-#ifdef odroid_xu
-				data[ptr]->credit[i] = cycle_to_jiffies(a_jp, o_freq[i]);
-#else
-				data[ptr]->credit[i] = a_jp;
-#endif
-				if (state) {
-					if (data[ptr]->need_move != -1 && data[ptr]->need_move != i) {
-						data[ptr]->need_move = i;
-						move_task_to_rq(i_rq ,data[ptr] ,0);
-					}
-					else {
-						if (data[ptr]->rq_e->rq->cpu != i && data[ptr]->instance->on_rq) {
-							// if task is scheduled to other cpu, task have to move to other queue.
-							printk("[algo] pid:%d ,from:%d ,to:%d\n",data[ptr]->instance->pid,data[ptr]->rq_e->rq->cpu,i_rq->cpu);
-							if (data[ptr]->select == 0 && 
-								data[ptr]->instance->pid != data[ptr]->rq_e->rq->curr->pid &&
-								data[ptr]->instance->pid != cpu_rq(task_cpu(data[ptr]->instance))->curr->pid)
-								move_task_to_rq(i_rq ,data[ptr] ,1);
-							else {
-								data[ptr]->need_move = i;
-								move_task_to_rq(i_rq ,data[ptr] ,0);
-							}
-							printk("[algo] select:%d from_pid:%d true_pid:%d\n",data[ptr]->select,data[ptr]->rq_e->rq->curr->pid,cpu_rq(task_cpu(data[ptr]->instance))->curr->pid);
-						}
-					}
-					ptr++;
-					ptr_max = ptr;
-					pre_load = 0;
-				}
-				else {
-					data[ptr]->dummy_workload -= a_jp;
-					data[ptr]->split = 1;
-					pre_load = a_jp / (o_freq[i] * kHZ / soft_float);
-					if (ptr + 1 < cluster_job && 
-							data[ptr]->dummy_workload < data[ptr+1]->dummy_workload)
-						ptr_max++;
-				}
-				if (!f_total)
-					break;
-			}
-		}
+
+		scheduling_cluster(index[k], core_count, cluster_job, j+1, total_workload, o_freq);	
 	}
 #ifdef _sched_debug
 	printk("=========output===========\n");
@@ -742,20 +747,9 @@ static void algo(int workload_predict)
 		printk("\n");
 	}
 #endif
-	kfree(data);
 
-	// symmetric freq.
-	for(i = 0; i < _MAX_CPU; i++) {
-		if (max_freq < o_freq[i]) { 
-			o_cpu = i;
-			max_freq = o_freq[i];
-		}
-	}
-#ifdef _sched_debug
-	printk("o_cpu:%u, max_freq:%u\n", o_cpu, max_freq);
-#endif
-	cpu_rq(0)->energy.set_freq = max_freq;	
-	//set_cpu_frequency(o_cpu, max_freq);	
+	for(i = 0; i < _MAX_CPU; i++) 
+		cpu_rq(i)->energy.set_freq = o_freq[i];	
 
 	_all_rq_unlock();
 	for (i = 0 ;i < _MAX_CPU; i++) {
@@ -850,6 +844,7 @@ const struct sched_class energy_sched_class = {
 
 #ifdef CONFIG_SMP
 	.select_task_rq		= select_task_rq_energy,
+	.post_schedule      = post_schedule_energy,
 #endif
 
 	.set_curr_task          = set_curr_task_energy,
