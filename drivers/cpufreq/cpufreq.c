@@ -369,7 +369,7 @@ void cpufreq_freq_transition_begin(struct cpufreq_policy *policy,
 wait:
 	wait_event(policy->transition_wait, !policy->transition_ongoing);
 
-	spin_lock(&policy->transition_lock);
+	//spin_lock(&policy->transition_lock);
 
 	if (unlikely(policy->transition_ongoing)) {
 		spin_unlock(&policy->transition_lock);
@@ -379,7 +379,7 @@ wait:
 	policy->transition_ongoing = true;
 	policy->transition_task = current;
 
-	spin_unlock(&policy->transition_lock);
+	//spin_unlock(&policy->transition_lock);
 
 	cpufreq_notify_transition(policy, freqs, CPUFREQ_PRECHANGE);
 }

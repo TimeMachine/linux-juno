@@ -2011,9 +2011,7 @@ int sched_fork(unsigned long clone_flags, struct task_struct *p)
 		return -EAGAIN;
 	} else if (rt_prio(p->prio)) {
 		p->sched_class = &rt_sched_class;
-	} else if (p->ee.alpha != 1) {
-		p->sched_class = &energy_sched_class;
-	} else {
+	} else if (p->sched_class != &energy_sched_class) {
 		p->sched_class = &fair_sched_class;
 	}
 

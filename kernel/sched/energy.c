@@ -4,7 +4,7 @@
 #include <linux/sort.h>
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
-//#define _debug
+#define _debug
 //#define _debug_pick
 #define _sched_debug
 #define kHZ 1000
@@ -78,8 +78,8 @@ static inline void _double_rq_unlock(int lock1, int lock2)
 
 static unsigned long long get_cpu_cycle(void)
 {
-	//return get_cycles();
-	return cpu_cycle();
+	return get_cycles();
+	//return cpu_cycle();
 }
 
 static void get_cpu_frequency(int cpu)
@@ -231,7 +231,7 @@ static void post_schedule_energy(struct rq *rq)
 static void pre_schedule_energy(struct rq *rq, struct task_struct *prev)
 {
 #ifdef _debug
-	printk("cpu:%d, %s ,pid:%d ,need_move:%d\n",smp_processor_id(),__PRETTY_FUNCTION__,prev->pid,prev->ee.need_move);
+	//printk("cpu:%d, %s ,pid:%d ,need_move:%d\n",smp_processor_id(),__PRETTY_FUNCTION__,prev->pid,prev->ee.need_move);
 #endif
 	prev->ee.select = 0;
 		
@@ -277,6 +277,26 @@ check_preempt_curr_energy(struct rq *rq, struct task_struct *p, int flags)
 	/* we're never preempted */
 }
 
+static void rq_selection(int *try_cpu, int this_cpu)
+{
+	int cluster = 0;
+	int i;
+	int core_count;
+	for (i = 0; i < big_cpu; i++)
+		if (this_cpu == index[1][i])	
+			cluster = 1;
+	core_count = cluster == 0 ? little_cpu : big_cpu;
+	/*
+	 * Priority : split task -> non-split task -> other CPU run queue
+	 * try_cpu  :		0				1			    2 , 3
+	 */
+	try_cpu[0] = this_cpu;
+	try_cpu[1] = this_cpu;
+	// try to steal other run queue
+	try_cpu[2] = index[cluster][(this_cpu - 1 + core_count) % core_count];
+	try_cpu[3] = index[cluster][(this_cpu + 1) % core_count];
+}
+
 static struct task_struct *
 pick_next_task_energy(struct rq *rq, struct task_struct *prev)
 {
@@ -290,15 +310,7 @@ pick_next_task_energy(struct rq *rq, struct task_struct *prev)
 	int retry = 0;
 	pre_schedule_energy(rq, prev);
 	put_prev_task_energy(rq, prev);
-	/*
-	 * Priority : split task -> non-split task -> other CPU run queue
-	 * try_cpu  :		0				1			    2 , 3
-	 */
-	try_cpu[0] = rq->cpu; 
-	try_cpu[1] = rq->cpu;
-	// try to steal other run queue
-	try_cpu[2] = (rq->cpu - 1 + _MAX_CPU) % _MAX_CPU; 
-	try_cpu[3] = (rq->cpu + 1) % _MAX_CPU; 
+	rq_selection(try_cpu, rq->cpu);	
 
 	for (i = 0; i < 4; i++) {
 		_all_rq_lock();
@@ -415,10 +427,10 @@ enqueue_task_energy(struct rq *rq, struct task_struct *p, int flags)
 	p->ee.rq_e = &true_rq->energy;
 	true_rq->energy.energy_nr_running++;
 	add_nr_running(true_rq, 1);
-	printk("*enqueue* pid:%d cpu:%d nr:%lu\n",p->pid,cpu,true_rq->energy.energy_nr_running);
+	printk("*enqueue* pid:%d cpu:%d nr:%lu flag:%d\n",p->pid,cpu,true_rq->energy.energy_nr_running, flags);
 	BUG_ON(true_rq->energy.energy_nr_running == 0);
 
-	if(flags == 0 && p->ee.first == 1) {
+	if((flags == 0 || flags == 2) && p->ee.first == 1) {
 	//update the new task info.
 		p->ee.workload = rq->energy.freq[rq->energy.state_number / 2] * kHZ;
 #ifdef odroid_xu
@@ -582,33 +594,35 @@ static int compare(const void *a, const void *b)
 
 #define Max_jobs 1000
 static struct sched_energy_entity *data[Max_jobs]; 
+static unsigned int o_freq[_MAX_CPU];
 static void scheduling_cluster(int *cpu_mask, int core_count, int job_count, int ptr,
 								 u64 total_workload, unsigned int *o_freq)
 {
 	#define soft_float 1000000
-	int i = 0, j = 0;
+	int i = 0, j = 0, k = 0;
 	int ptr_max = ptr;
 	unsigned int pre_load = 0;
 	struct rq *i_rq;
 
 	pre_load = 0;
-	for (; cpu_mask[i] != -1; i++) {
+	for (; k < core_count; k++) {
 		int f_total = 0;
 		int a_jp = 0;
+		i = cpu_mask[k];
 		//printk("[algo debug] i:%d ptr:%d total_workload:%llu\n",i ,ptr,total_workload);
 		i_rq = cpu_rq(i);
 		if (total_workload == 0) {
 			o_freq[i] = 0;
 			continue;
 		}
-		for (j = 0; j < i_rq->energy.state_number; j++) {
+		for (j = i_rq->energy.state_number - 1; j >= 0; j--) {
 			if (((u64) i_rq->energy.freq[j] * kHZ < data[ptr_max]->dummy_workload) ||
 					((u64) i_rq->energy.freq[j] * kHZ * (core_count - i) < total_workload) ||
 					((1 * soft_float - pre_load) < (data[ptr]->dummy_workload) / (i_rq->energy.freq[j] * kHZ / soft_float) ))
 				break;
 		}
 		//printk("__debug cpu_rq(i)->energy.freq[j]:%d,data[ptr_max]->workload:%llu,total_workload:%llu,pre_load:%u\n",cpu_rq(i)->energy.freq[j],data[ptr_max]->dummy_workload,total_workload,pre_load);
-		o_freq[i] = j == 0 ? i_rq->energy.freq[j] : i_rq->energy.freq[j-1];  	
+		o_freq[i] = j == 4 ? i_rq->energy.freq[4] : i_rq->energy.freq[j + 1];  	
 		f_total = o_freq[i] * kHZ;
 		a_jp = 0;
 		while ( ptr < job_count ) {
@@ -664,7 +678,6 @@ static void scheduling_cluster(int *cpu_mask, int core_count, int job_count, int
 static void algo(int workload_predict)
 {
 	u64 total_workload = 0;
-	unsigned int o_freq[_MAX_CPU] = {0};
 	int job_count = 0, cluster_job = 0;
 	struct rq *i_rq;
 	struct list_head *head;
@@ -705,6 +718,7 @@ static void algo(int workload_predict)
 		_all_rq_unlock();
 		return;
 	}
+	memset(o_freq, 0, _MAX_CPU * sizeof(unsigned int));
 	sort(data, job_count, sizeof(struct sched_energy_entity*), compare, NULL);
 #ifdef _sched_debug
 	printk("========= input===========\n");
@@ -720,7 +734,7 @@ static void algo(int workload_predict)
 	printk("\n");
 #endif
 
-	for (i = 0,k = 0; k < 2; k++) {
+	for (j = 0, k = 0; k < 2 && j != -1; k++) {
 		core_count = k == 0 ? little_cpu : big_cpu;
 		j = job_count - cluster_job - 1; //the index of the remaining task.
 		cluster_job = 0;
@@ -733,7 +747,6 @@ static void algo(int workload_predict)
 			total_workload += data[j]->dummy_workload;
 			cluster_job++;
 		}
-
 		scheduling_cluster(index[k], core_count, cluster_job, j+1, total_workload, o_freq);	
 	}
 #ifdef _sched_debug
@@ -748,8 +761,15 @@ static void algo(int workload_predict)
 	}
 #endif
 
-	for(i = 0; i < _MAX_CPU; i++) 
-		cpu_rq(i)->energy.set_freq = o_freq[i];	
+	// symmetric in the cluster.
+	for(i = 0; i < 2; i++) { 
+		int max_freq = -1;
+		core_count = i == 0 ? little_cpu : big_cpu;
+		for (j = 0; j < core_count; j++)
+			if (max_freq < o_freq[index[i][j]])
+				max_freq = o_freq[index[i][j]];
+		cpu_rq(i)->energy.set_freq = max_freq;	
+	}
 
 	_all_rq_unlock();
 	for (i = 0 ;i < _MAX_CPU; i++) {
@@ -854,6 +874,7 @@ const struct sched_class energy_sched_class = {
 
 	.prio_changed		= prio_changed_energy,
 	.switched_to		= switched_to_energy,
+	.update_curr		= update_curr_energy,
 };
 
 __init void init_sched_energy_class(void)
