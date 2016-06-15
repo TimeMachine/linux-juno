@@ -5,26 +5,29 @@
 #include <linux/hrtimer.h>
 #include <linux/ktime.h>
 #define _debug
-//#define _debug_pick
+#define _debug_pick
 #define _sched_debug
 #define kHZ 1000
 //#define odroid_xu
 #define juno
+
+#define jiffies_to_cycle(jiffies,freq)  (jiffies / (_1s_jiffies / kHZ)) * freq
+#define cycle_to_jiffies(cycle,freq)  (cycle / freq) * (_1s_jiffies / kHZ)
 
 #ifdef odroid_xu
 #define little_cpu 4
 #define big_cpu 0
 #define _1s_jiffies 24000000
 static u32 freq_now;
-#define jiffies_to_cycle(jiffies)  (jiffies / (_1s_jiffies / kHZ)) * freq_now
-#define cycle_to_jiffies(cycle,freq)  (cycle / freq) * (_1s_jiffies / kHZ)
 #endif
 
 #ifdef juno
+#define _1s_jiffies 50000000
 #define little_cpu 4
 #define big_cpu 2
 #define _MAX_CPU 6
 static int index[2][4] = {{0,3,4,5}, {1,2}}; // Little core cluster and Big core cluster.
+static u32 freq_now[_MAX_CPU];
 #endif
 
 // lock by main_schedule
@@ -112,14 +115,12 @@ static void set_cpu_frequency(unsigned int cpu ,unsigned int freq)
 static void reschedule(int cpu)
 {
 	struct rq *i_rq = cpu_rq(cpu);
-#ifdef _debug_pick
-		printk("resched %d, pid:%d\n",cpu,i_rq->curr->pid);
-#endif
+	//printk("resched %d, pid:%d\n",cpu,i_rq->curr->pid);
 	if (cpu == smp_processor_id() && raw_spin_is_locked(&i_rq->lock))
 		resched_curr(i_rq);
-	else if(cpu != smp_processor_id() && i_rq->curr == i_rq->idle) 
+	//else if(cpu != smp_processor_id() && i_rq->curr == i_rq->idle) 
 		// test....
-		wake_up_nohz_cpu(cpu);
+	//	wake_up_nohz_cpu(cpu);
 		//wake_up_idle_cpu(cpu);
 	else
 		resched_cpu(cpu);
@@ -165,16 +166,10 @@ static void update_credit(struct task_struct *curr)
 	curr->ee.execute_start = get_cpu_cycle();
 }
 
-static void update_curr_energy(struct rq *rq)
+static void update_curr_task(struct rq *rq)
 {
 	struct task_struct *curr = rq->curr;
 	u64 delta_exec;
-	
-	//update the energy info.
-	update_credit(curr);
-	rq->energy.time_sharing = rq->clock_task;
-
-	//update the curr info.		
 	delta_exec = rq->clock_task - curr->se.exec_start;
 	if (unlikely((s64)delta_exec < 0))
 		delta_exec = 0;
@@ -187,6 +182,16 @@ static void update_curr_energy(struct rq *rq)
 
 	curr->se.exec_start = rq->clock_task;
 	cpuacct_charge(curr, delta_exec);
+}
+
+static void update_curr_energy(struct rq *rq)
+{
+	
+	//update the energy info.
+	update_credit(rq->curr);
+	rq->energy.time_sharing = rq->clock_task;
+	//update the curr info.		
+	update_curr_task(rq);
 }
 
 static inline int on_energy_rq(struct sched_energy_entity *ee)
@@ -216,6 +221,26 @@ static void move_task_to_rq(struct rq *rq, struct sched_energy_entity *task ,int
 	//printk("after move pid:%d energy_nr:%lu nr:%u task_contributes_to_load:%d cpu:%d\n",task->instance->pid, task->rq_e->energy_nr_running, task->rq_e->rq->nr_running, task_contributes_to_load(task->instance),task->rq_e->rq->cpu);
 }
 
+static void rq_selection(int *try_cpu, int this_cpu)
+{
+	int cluster = 0;
+	int i;
+	int core_count;
+	for (i = 0; i < big_cpu; i++)
+		if (this_cpu == index[1][i])	
+			cluster = 1;
+	core_count = cluster == 0 ? little_cpu : big_cpu;
+	/*
+	 * Priority : split task -> non-split task -> other CPU run queue
+	 * try_cpu  :		0				1			    2 , 3
+	 */
+	try_cpu[0] = this_cpu;
+	try_cpu[1] = this_cpu;
+	// try to steal other run queue
+	try_cpu[2] = index[cluster][(this_cpu - 1 + core_count) % core_count];
+	try_cpu[3] = index[cluster][(this_cpu + 1) % core_count];
+}
+
 #ifdef CONFIG_SMP
 static int
 select_task_rq_energy(struct task_struct *p, int cpu, int sd_flag, int flags)
@@ -241,12 +266,11 @@ static void pre_schedule_energy(struct rq *rq, struct task_struct *prev)
 		prev->ee.split && 
 		prev->ee.credit[rq->cpu] == 0) {
 		int move = -1;
-		int near[2];
+		int near[4];
 		int i;
 		_all_rq_lock();
-		near[0] = (rq->cpu - 1 + _MAX_CPU) % _MAX_CPU; 
-		near[1] = (rq->cpu + 1) % _MAX_CPU; 
-		for (i = 0; i < 2; i++) {
+		rq_selection(near, rq->cpu);
+		for (i = 2; i <= 3; i++) {
 			if (prev->ee.credit[near[i]])
 				move = near[i];
 		}
@@ -262,9 +286,7 @@ static void pre_schedule_energy(struct rq *rq, struct task_struct *prev)
 		
 	if (unlikely(rq->energy.set_freq != -1)) {	
 		set_cpu_frequency(rq->cpu, rq->energy.set_freq);	
-#ifdef odroid_xu
-		freq_now = rq->energy.set_freq;
-#endif
+		freq_now[rq->cpu] = rq->energy.set_freq;
 		rq->energy.set_freq = -1;
 	}
 }
@@ -275,26 +297,6 @@ static void
 check_preempt_curr_energy(struct rq *rq, struct task_struct *p, int flags)
 {
 	/* we're never preempted */
-}
-
-static void rq_selection(int *try_cpu, int this_cpu)
-{
-	int cluster = 0;
-	int i;
-	int core_count;
-	for (i = 0; i < big_cpu; i++)
-		if (this_cpu == index[1][i])	
-			cluster = 1;
-	core_count = cluster == 0 ? little_cpu : big_cpu;
-	/*
-	 * Priority : split task -> non-split task -> other CPU run queue
-	 * try_cpu  :		0				1			    2 , 3
-	 */
-	try_cpu[0] = this_cpu;
-	try_cpu[1] = this_cpu;
-	// try to steal other run queue
-	try_cpu[2] = index[cluster][(this_cpu - 1 + core_count) % core_count];
-	try_cpu[3] = index[cluster][(this_cpu + 1) % core_count];
 }
 
 static struct task_struct *
@@ -317,8 +319,8 @@ pick_next_task_energy(struct rq *rq, struct task_struct *prev)
 		e_rq = &cpu_rq(try_cpu[i])->energy;
 		//if(cpu_rq(try_cpu[i])->online != 1 || e_rq->energy_nr_running == 0){
 		if(e_rq->energy_nr_running == 0){
-			//if (rq->curr->policy == SCHED_ENERGY && cpu_rq(try_cpu[i])->online == 1)
-			//	printk("[debug pick energy_nr_running=0] cpu:%d i:%d \n",e_rq->rq->cpu,i);
+			//if (rq->curr->policy == SCHED_ENERGY)
+			//	printk("[debug pick energy_nr_running=0] cpu:%d try:%d \n",e_rq->rq->cpu,try_cpu[i]);
 			_all_rq_unlock();
 			continue;
 		}
@@ -326,6 +328,7 @@ pick_next_task_energy(struct rq *rq, struct task_struct *prev)
 		for (j = 0; pos != &e_rq->queue; pos = pos->next) {
 			next_ee = list_entry(pos, struct sched_energy_entity, list_item);
 			next_ee_cpu = task_cpu(next_ee->instance);
+			//if (i == 0||i==1)
 			//printk("[debug pick] cpu:%d pid:%d i:%d nr:%lu %d %d %d %d %d\n",rq->cpu,next_ee->instance->pid,i,e_rq->energy_nr_running,!next_ee->credit[rq->cpu],next_ee->instance->state != TASK_RUNNING,next_ee->select == 1,next_ee->need_move >= 0 && next_ee->need_move != rq->cpu,next_ee_cpu != try_cpu[i] &&(cpu_rq(next_ee_cpu)->curr->pid == next_ee->instance->pid));
 			if (!next_ee->credit[rq->cpu])
 				continue;
@@ -412,11 +415,10 @@ enqueue_task_energy(struct rq *rq, struct task_struct *p, int flags)
 #endif
 	// for the first time (init cpu freq)
 	if ( unlikely(rq->energy.freq == NULL) ) {
-		for (i = 0; i < _MAX_CPU; i++)  
+		for (i = 0; i < _MAX_CPU; i++) {  
 			get_cpu_frequency(i);
-#ifdef odroid_xu
-		freq_now = rq->energy.freq[0];
-#endif
+			freq_now[i] = cpu_rq(i)->energy.freq[0];
+		}
 	}
 	_all_rq_lock();
 	if (p->ee.need_move != -1)
@@ -432,12 +434,8 @@ enqueue_task_energy(struct rq *rq, struct task_struct *p, int flags)
 
 	if((flags == 0 || flags == 2) && p->ee.first == 1) {
 	//update the new task info.
-		p->ee.workload = rq->energy.freq[rq->energy.state_number / 2] * kHZ;
-#ifdef odroid_xu
-		p->ee.credit[rq->cpu] = cycle_to_jiffies(p->ee.workload, freq_now);
-#else
-		p->ee.credit[rq->cpu] = p->ee.workload;
-#endif
+		p->ee.workload = rq->energy.freq[0] * kHZ;
+		p->ee.credit[rq->cpu] = cycle_to_jiffies(p->ee.workload, freq_now[rq->cpu]);
 		printk("[enqueue] new job pid:%d, total_job:%d\n",p->pid, total_job);
 		total_job++;
 	
@@ -464,6 +462,7 @@ dequeue_task_energy(struct rq *rq, struct task_struct *p, int flags)
 #ifdef _debug
 	printk("cpu:%d, %s ,pid:%d nr:%lu need_move:%d begin\n",smp_processor_id(),__PRETTY_FUNCTION__,p->pid,rq->energy.energy_nr_running,p->ee.need_move);
 #endif
+	printk("[debug nr] nr:%d fair_nr:%d\n",rq->nr_running, rq->cfs.h_nr_running);
 	if (p->ee.need_move != -1)
 		cpu = p->ee.need_move;
 	true_rq = cpu_rq(cpu);
@@ -487,6 +486,8 @@ dequeue_task_energy(struct rq *rq, struct task_struct *p, int flags)
 				BUG_ON(cpu_rq(1)->energy.energy_nr_running!=0);
 				BUG_ON(cpu_rq(2)->energy.energy_nr_running!=0);
 				BUG_ON(cpu_rq(3)->energy.energy_nr_running!=0);
+				BUG_ON(cpu_rq(4)->energy.energy_nr_running!=0);
+				BUG_ON(cpu_rq(5)->energy.energy_nr_running!=0);
 			}
 		}
 		need_reschedule = 1;
@@ -537,21 +538,13 @@ static void workload_prediction(void)
 			for(pos = head->next; pos != head; pos = pos->next) {
 				data = list_entry(pos ,struct sched_energy_entity, list_item);
 				// predict workload from the statistics.
-#ifdef odroid_xu
-				printk("pid:%d, cpu:%d, exeute_start:%llu, total_execution:%llu, workload:%llu, workload(jiffies):%llu\n",data->instance->pid , i, data->execute_start ,data->total_execution, data->workload, cycle_to_jiffies(data->workload, freq_now));
-#else
-				printk("pid:%d, cpu:%d, exeute_start:%llu, total_execution:%llu, workload:%llu\n",data->instance->pid , i, data->execute_start ,data->total_execution, data->workload);
-#endif
+				printk("pid:%d, cpu:%d, exeute_start:%llu, total_execution:%llu, workload:%llu, workload(jiffies):%llu\n",data->instance->pid , i, data->execute_start ,data->total_execution, data->workload, cycle_to_jiffies(data->workload, freq_now[i_rq->cpu]));
 				// for the newly job
 				if (data->total_execution == 0) {
-					data->workload = i_rq->energy.freq[i_rq->energy.state_number / 2] * kHZ; // kHz -> Hz
+					data->workload = i_rq->energy.freq[0] * kHZ; // kHz -> Hz
 					data->over_predict = 0;
 				}
-#ifdef odroid_xu
-				else if (jiffies_to_cycle(data->total_execution) >= data->workload) {
-#else
-				else if (data->total_execution >= data->workload) {
-#endif
+				else if (jiffies_to_cycle(data->total_execution, freq_now[i_rq->cpu]) >= data->workload) {
 					if (data->over_predict) 
 						data->workload = (i_rq->energy.freq[0] + data->workload / kHZ) / 2 * kHZ;
 					else
@@ -559,11 +552,7 @@ static void workload_prediction(void)
 					data->over_predict++;
 				}
 				else {
-#ifdef odroid_xu
-					data->workload = jiffies_to_cycle(data->total_execution);
-#else
-					data->workload = data->total_execution;
-#endif
+					data->workload = jiffies_to_cycle(data->total_execution, freq_now[i_rq->cpu]);
 					data->over_predict = 0;
 				}
 				// reset the statistics.
@@ -617,7 +606,7 @@ static void scheduling_cluster(int *cpu_mask, int core_count, int job_count, int
 		}
 		for (j = i_rq->energy.state_number - 1; j >= 0; j--) {
 			if (((u64) i_rq->energy.freq[j] * kHZ < data[ptr_max]->dummy_workload) ||
-					((u64) i_rq->energy.freq[j] * kHZ * (core_count - i) < total_workload) ||
+					((u64) i_rq->energy.freq[j] * kHZ * (core_count - k) < total_workload) ||
 					((1 * soft_float - pre_load) < (data[ptr]->dummy_workload) / (i_rq->energy.freq[j] * kHZ / soft_float) ))
 				break;
 		}
@@ -632,11 +621,7 @@ static void scheduling_cluster(int *cpu_mask, int core_count, int job_count, int
 			a_jp = state ? data[ptr]->dummy_workload : f_total;
 			total_workload -= a_jp;
 			f_total -= a_jp;
-#ifdef odroid_xu
 			data[ptr]->credit[i] = cycle_to_jiffies(a_jp, o_freq[i]);
-#else
-			data[ptr]->credit[i] = a_jp;
-#endif
 			if (state) {
 				if (data[ptr]->need_move != -1 && data[ptr]->need_move != i) {
 					data[ptr]->need_move = i;
@@ -656,6 +641,8 @@ static void scheduling_cluster(int *cpu_mask, int core_count, int job_count, int
 						}
 						printk("[algo] select:%d from_pid:%d true_pid:%d\n",data[ptr]->select,data[ptr]->rq_e->rq->curr->pid,cpu_rq(task_cpu(data[ptr]->instance))->curr->pid);
 					}
+					else
+						printk("[algo] pid:%d cpu:%d i%d on_rq:%d\n",data[ptr]->instance->pid,data[ptr]->rq_e->rq->cpu,i,data[ptr]->instance->on_rq);
 				}
 				ptr++;
 				ptr_max = ptr;
@@ -693,19 +680,11 @@ static void algo(int workload_predict)
 			for(pos = head->next; pos != head; pos = pos->next) {
 				data[job_count] = list_entry(pos ,struct sched_energy_entity, list_item);
 				if (data[job_count]->instance->state == TASK_RUNNING && 
-#ifdef odroid_xu
-					data[job_count]->workload > jiffies_to_cycle(data[job_count]->total_execution)) {
-#else
-					data[job_count]->workload > data[job_count]->total_execution) {
-#endif
+					data[job_count]->workload > jiffies_to_cycle(data[job_count]->total_execution, freq_now[i_rq->cpu])) {
 					if (workload_predict)
 						data[job_count]->dummy_workload = data[job_count]->workload;
 					else
-#ifdef odroid_xu
-						data[job_count]->dummy_workload = data[job_count]->workload - jiffies_to_cycle( data[job_count]->total_execution);
-#else
-						data[job_count]->dummy_workload = data[job_count]->workload - data[job_count]->total_execution;
-#endif
+						data[job_count]->dummy_workload = data[job_count]->workload - jiffies_to_cycle( data[job_count]->total_execution, freq_now[i_rq->cpu]);
 					for (k = 0 ;k < _MAX_CPU; k++) 
 						data[job_count]->credit[k] = 0;
 					data[job_count]->split = 0;
@@ -835,6 +814,7 @@ static void set_curr_task_energy(struct rq *rq)
 
 static void switched_to_energy(struct rq *rq, struct task_struct *p)
 {
+	printk("[switch to] pid:%d cpu:%d\n", p->pid, rq->cpu);
 	if (rq->curr == p)
 		reschedule(rq->cpu);	
 }
@@ -874,7 +854,7 @@ const struct sched_class energy_sched_class = {
 
 	.prio_changed		= prio_changed_energy,
 	.switched_to		= switched_to_energy,
-	.update_curr		= update_curr_energy,
+	.update_curr		= update_curr_task,
 };
 
 __init void init_sched_energy_class(void)
